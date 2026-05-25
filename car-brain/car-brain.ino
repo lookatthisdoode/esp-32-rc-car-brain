@@ -25,11 +25,11 @@ struct Config {
 };
 
 // ─── Presets ─────────────────────────────────────────────────────────────────
-const char* presetNames[] = { "Slow", "Normal", "Fast" };
+const char* presetNames[] = { "Drive", "Drift", "Race" };
 const Config presets[] = {
-  { 1200, 15, 0.15f, 0.05f, 90, 0, 180, false },  // Slow
-  { 1400, 10, 0.30f, 0.09f, 90, 0, 180, false },  // Normal
-  { 1800,  5, 0.50f, 0.15f, 90, 0, 180, false },  // Fast
+  { 1200, 15, 0.10f, 0.05f, 90, 0, 180, false },  // Drive
+  { 1420, 5, 0.15f, 0.06f, 90, 0, 180, false },  // Drift
+  { 1800,  5, 0.50f, 0.15f, 90, 30, 150, false },  // Race
 };
 const int presetCount = 3;
 int currentPreset = 1;
