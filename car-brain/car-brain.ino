@@ -26,10 +26,11 @@ struct Config {
 
 // ─── Presets ─────────────────────────────────────────────────────────────────
 const char* presetNames[] = { "Drive", "Drift", "Race" };
+// 1800 - lego gears start grinding and esp32 power can bounce, do not set > 1800!
 const Config presets[] = {
-  { 1200, 15, 0.10f, 0.05f, 90, 0, 180, false },  // Drive
-  { 1420, 5, 0.15f, 0.06f, 90, 0, 180, false },  // Drift
-  { 1800,  5, 0.50f, 0.15f, 90, 30, 150, false },  // Race
+  { 1200, 15, 0.10f, 0.05f, 90, 0, 180, false },  // Drive, almost no drift
+  { 1420, 5, 0.15f, 0.06f, 90, 0, 180, false },  // Drift, kind of smooth
+  { 1550,  5, 0.50f, 0.15f, 90, 30, 150, false },  // Race, limited servo angle, spins too fast though
 };
 const int presetCount = 3;
 int currentPreset = 1;
