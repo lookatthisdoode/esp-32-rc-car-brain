@@ -105,24 +105,38 @@ unsigned long lastActivityTime = 0;
 #define MENU_TIMEOUT_MS 10000
 
 // ─── Encoder  ─────────────────────────────────
+uint8_t stableRead(int pin) {
+  uint8_t count = 0;
+  for (int i = 0; i < 3; i++) {
+    count += digitalRead(pin);
+    delayMicroseconds(50);
+  }
+  return (count >= 2) ? 1 : 0;
+}
+
 int readEncoder() {
   static uint8_t prevState = 3;
   static int     accum     = 0;
   static unsigned long lastTick = 0;
+  static unsigned long lastChange = 0;
 
-  uint8_t clk   = digitalRead(ENC_CLK);
-  uint8_t dt    = digitalRead(ENC_DT);
+  uint8_t clk   = stableRead(ENC_CLK);
+  uint8_t dt    = stableRead(ENC_DT);
   uint8_t state = (clk << 1) | dt;
 
-  if (prevState == 3 && state == 1) accum++;
-  if (prevState == 1 && state == 0) accum++;
-  if (prevState == 3 && state == 2) accum--;
-  if (prevState == 2 && state == 0) accum--;
-  if (state != prevState) { prevState = state; lastTick = millis(); }
+  if (state != prevState && millis() - lastChange >= 2) {
+    if (prevState == 3 && state == 1) accum++;
+    if (prevState == 1 && state == 0) accum++;
+    if (prevState == 3 && state == 2) accum--;
+    if (prevState == 2 && state == 0) accum--;
+    prevState = state;
+    lastChange = millis();
+    lastTick = millis();
+  }
 
   int delta = 0;
   unsigned long age = millis() - lastTick;
-  int threshold = (age < 80) ? 1 : 2; // fast spin = threshold 1, slow = 2
+  int threshold = (age < 80) ? 1 : 2; // 2:4 for less noise but less responsive
 
   if (accum >=  threshold) { delta =  1; accum = 0; }
   if (accum <= -threshold) { delta = -1; accum = 0; }
@@ -164,6 +178,7 @@ enum Screen {
   SCR_MAIN_MENU,
   SCR_MOTOR_MENU,
   SCR_SERVO_MENU,
+  SCR_PRESET_MENU,
   SCR_CTRL_MONITOR,
   SCR_MANUAL_CONTROL,
   SCR_EDIT_VALUE
@@ -171,8 +186,8 @@ enum Screen {
 
 Screen currentScreen = SCR_DRIVE;
 
-const char* mainMenuItems[] = { "Motor", "Servo", "Controller", "Manual Control" };
-const int mainMenuCount = 4;
+const char* mainMenuItems[] = { "Motor", "Servo", "Mode", "Controller", "Manual Control" };
+const int mainMenuCount = 5;
 const char* motorMenuItems[] = { "Max timing", "Deadzone", "Accel rate", "Decay rate" };
 const int motorMenuCount = 4;
 const char* servoMenuItems[] = { "Servo min", "Servo max", "Reverse", "Center" };
@@ -580,8 +595,12 @@ void loop() {
             currentScreen = SCR_SERVO_MENU;
             menuIndex = 0;
             break;
-          case 2: currentScreen = SCR_CTRL_MONITOR; break;
-          case 3: 
+          case 2:
+            currentScreen = SCR_PRESET_MENU;
+            menuIndex = currentPreset;
+            break;
+          case 3: currentScreen = SCR_CTRL_MONITOR; break;
+          case 4:
             currentScreen    = SCR_MANUAL_CONTROL;
             manualMotor      = 1000;
             manualServo      = cfg.servoCenter;
@@ -636,10 +655,27 @@ void loop() {
         drawScrollMenu("Servo", servoMenuItems, servoMenuCount, menuIndex);
       break;
 
-    case SCR_CTRL_MONITOR:
+    case SCR_PRESET_MENU:
+      menuIndex = constrain(menuIndex + delta, 0, presetCount - 1);
+      if (btn == 1) {
+        currentPreset = menuIndex;
+        cfg = presets[currentPreset];
+        presetAlertTime = millis();
+        currentScreen = SCR_DRIVE;
+        menuIndex = 0;
+      }
       if (btn == 2) {
         currentScreen = SCR_MAIN_MENU;
         menuIndex = 2;
+      }
+      if (currentScreen == SCR_PRESET_MENU)
+        drawScrollMenu("Mode", presetNames, presetCount, menuIndex);
+      break;
+
+    case SCR_CTRL_MONITOR:
+      if (btn == 2) {
+        currentScreen = SCR_MAIN_MENU;
+        menuIndex = 3;
       }
       updateCtrlMonitor();
       break;
@@ -658,7 +694,7 @@ void loop() {
         steeringServo.write(cfg.servoCenter);
         shifterServo.write(90);
         currentScreen = SCR_MAIN_MENU;
-        menuIndex = 3;
+        menuIndex = 4;
       }
       updateManualControl();
       break;
