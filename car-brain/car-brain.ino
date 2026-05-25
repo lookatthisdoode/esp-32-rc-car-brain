@@ -2,7 +2,6 @@
 #include <Adafruit_SSD1306.h>
 #include <ESP32Servo.h>
 #include <Bluepad32.h>
-// #include <Preferences.h>
 #include "splash.h"
 // ─── Pins ────────────────────────────────────────────────────────────────────
 #define MOTOR_PIN 19
@@ -25,41 +24,21 @@ struct Config {
   bool servoReverse;
 };
 
-Config cfg = { 1400, 10, 0.30f, 0.09f, 90, 0, 180, false };
-
-
-const Config defaults = {
-  1400, 10, 0.30f, 0.09f, 90, 0, 180, false
+// ─── Presets ─────────────────────────────────────────────────────────────────
+const char* presetNames[] = { "Slow", "Normal", "Fast" };
+const Config presets[] = {
+  { 1200, 15, 0.15f, 0.05f, 90, 0, 180, false },  // Slow
+  { 1400, 10, 0.30f, 0.09f, 90, 0, 180, false },  // Normal
+  { 1800,  5, 0.50f, 0.15f, 90, 0, 180, false },  // Fast
 };
+const int presetCount = 3;
+int currentPreset = 1;
+Config cfg = presets[1];
 
-// // ─── Persistent storage  ────────────────────────────────────────────────────────────────────
-// Preferences prefs;
-// void loadConfig() {
-//   prefs.begin("rccar", true); // read-only
-//   cfg.maxTiming    = prefs.getInt("maxTiming",    1200);
-//   cfg.deadzone     = prefs.getInt("deadzone",     10);
-//   cfg.expAccelRate = prefs.getFloat("accelRate",  0.30f);
-//   cfg.expDecayRate = prefs.getFloat("decayRate",  0.09f);
-//   cfg.servoMin     = prefs.getInt("servoMin",     0);
-//   cfg.servoMax     = prefs.getInt("servoMax",     180);
-//   cfg.servoReverse = prefs.getBool("servoRev",    false);
-//   prefs.end();
-//   Serial.printf("Loaded: maxTiming=%d deadzone=%d servoMin=%d servoMax=%d\n", cfg.maxTiming, cfg.deadzone, cfg.servoMin, cfg.servoMax);
-// }
+bool lastL1 = false, lastR1 = false;
+unsigned long presetAlertTime = 0;
+#define PRESET_ALERT_MS 1500
 
-
-// void saveConfig() {
-//   prefs.begin("rccar", false); // read-write
-//   prefs.putInt("maxTiming",   cfg.maxTiming);
-//   prefs.putInt("deadzone",    cfg.deadzone);
-//   prefs.putFloat("accelRate", cfg.expAccelRate);
-//   prefs.putFloat("decayRate", cfg.expDecayRate);
-//   prefs.putInt("servoMin",    cfg.servoMin);
-//   prefs.putInt("servoMax",    cfg.servoMax);
-//   prefs.putBool("servoRev",   cfg.servoReverse);
-//   prefs.end();
-//   Serial.printf("Saved: maxTiming=%d deadzone=%d servoMin=%d servoMax=%d\n", cfg.maxTiming, cfg.deadzone, cfg.servoMin, cfg.servoMax);
-// }
 // ─── OLED ────────────────────────────────────────────────────────────────────
 Adafruit_SSD1306 display(128, 64, &Wire, -1);
 const bool hasSplash = true;
@@ -192,8 +171,8 @@ enum Screen {
 
 Screen currentScreen = SCR_DRIVE;
 
-const char* mainMenuItems[] = { "Motor", "Servo", "Controller", "Manual Control", "Save config (WIP)" };
-const int mainMenuCount = 5;
+const char* mainMenuItems[] = { "Motor", "Servo", "Controller", "Manual Control" };
+const int mainMenuCount = 4;
 const char* motorMenuItems[] = { "Max timing", "Deadzone", "Accel rate", "Decay rate" };
 const int motorMenuCount = 4;
 const char* servoMenuItems[] = { "Servo min", "Servo max", "Reverse", "Center" };
@@ -330,7 +309,7 @@ void updateDriveDisplay() {
   display.setTextColor(SSD1306_WHITE);
   if (ctrlConnected) {
     display.setCursor(0, 0);
-    display.printf("CTRL%s [%c]%s", expMode ? " [EXP]" : "", gearChar(currentGear), handbrake ? " BRK" : "");
+    display.printf("%s%s [%c]%s", presetNames[currentPreset], expMode ? " [EXP]" : "", gearChar(currentGear), handbrake ? " BRK" : "");
     display.setCursor(0, 10);
     display.printf("Motor: %4dus", motorSignal);
     drawMotorBar(0, 19, 128, 8, motorSignal);
@@ -352,6 +331,16 @@ void updateDriveDisplay() {
     display.setCursor(4, 54);
     display.print("Click once for menu");
   }
+
+  if (millis() - presetAlertTime < PRESET_ALERT_MS) {
+    display.fillRect(14, 18, 100, 28, SSD1306_BLACK);
+    display.drawRect(14, 18, 100, 28, SSD1306_WHITE);
+    display.setTextSize(2);
+    display.setCursor(20, 24);
+    display.printf("<%s>", presetNames[currentPreset]);
+    display.setTextSize(1);
+  }
+
   display.display();
 }
 
@@ -430,11 +419,8 @@ void setup() {
       display.setTextSize(1);
     }
     display.display();
-    delay(2000);
   }
 
-  //  WIP 
-  // loadConfig();
 
   // Encoder pins
   pinMode(ENC_CLK, INPUT_PULLUP);
@@ -463,14 +449,6 @@ void setup() {
 
 // ─── Loop ────────────────────────────────────────────────────────────────────
 void loop() {
-  static int lastClk = -1, lastDt = -1;
-  int clk = digitalRead(ENC_CLK);
-  int dt = digitalRead(ENC_DT);
-  if (clk != lastClk || dt != lastDt) {
-    Serial.printf("CLK:%d DT:%d\n", clk, dt);
-    lastClk = clk;
-    lastDt = dt;
-  }
   int delta = readEncoder();
   int btn = readButton();
   if (delta != 0 || btn != 0) lastActivityTime = millis();
@@ -516,6 +494,21 @@ void loop() {
 
     shifterAngle = gearToAngle(currentGear);
     handbrake = l2Val > 50;
+
+    bool l1Pressed = dualshock->buttons() & BUTTON_SHOULDER_L;
+    bool r1Pressed = dualshock->buttons() & BUTTON_SHOULDER_R;
+    if (l1Pressed && !lastL1 && currentPreset > 0) {
+      currentPreset--;
+      cfg = presets[currentPreset];
+      presetAlertTime = millis();
+    }
+    if (r1Pressed && !lastR1 && currentPreset < presetCount - 1) {
+      currentPreset++;
+      cfg = presets[currentPreset];
+      presetAlertTime = millis();
+    }
+    lastL1 = l1Pressed;
+    lastR1 = r1Pressed;
 
     int rawAngle;
     if (lxVal >= 0) {
@@ -591,18 +584,9 @@ void loop() {
           case 3: 
             currentScreen    = SCR_MANUAL_CONTROL;
             manualMotor      = 1000;
-            manualServo      = 90;
+            manualServo      = cfg.servoCenter;
             manualShifter    = 90;
             manualEditTarget = 0;
-            break;
-          case 4:
-            // saveConfig(); WIP
-            display.clearDisplay();
-            display.setTextColor(SSD1306_WHITE);
-            display.setCursor(20, 28);
-            display.print("Saved!");
-            display.display();
-            delay(1000);
             break;
         }
       }
@@ -704,3 +688,4 @@ void loop() {
 
   delay(10);
 }
+
