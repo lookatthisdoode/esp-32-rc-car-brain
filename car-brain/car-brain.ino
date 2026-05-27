@@ -16,6 +16,7 @@
 struct Config {
   int maxTiming;
   int deadzone;
+  int steerDeadzone;
   float expAccelRate;
   float expDecayRate;
   int servoCenter;
@@ -28,9 +29,9 @@ struct Config {
 const char* presetNames[] = { "Drive", "Drift", "Race" };
 // 1800 - lego gears start grinding and esp32 power can bounce, do not set > 1800!
 const Config presets[] = {
-  { 1200, 15, 0.10f, 0.05f, 90, 0, 180, false },  // Drive, almost no drift
-  { 1420, 5, 0.15f, 0.06f, 90, 0, 180, false },  // Drift, kind of smooth
-  { 1550,  5, 0.50f, 0.15f, 90, 30, 150, false },  // Race, limited servo angle, spins too fast though
+  { 1200, 15, 10, 0.10f, 0.05f, 90, 0, 180, false },  // Drive, almost no drift
+  { 1350, 5, 10, 0.10f, 0.06f, 90, 0, 180, false },  // Drift, kind of smooth
+  { 1500,  5, 10, 0.50f, 0.15f, 90, 30, 150, false },  // Race, limited servo angle, spins too fast though
 };
 const int presetCount = 3;
 int currentPreset = 1;
@@ -191,8 +192,8 @@ const char* mainMenuItems[] = { "Motor", "Servo", "Mode", "Controller", "Manual 
 const int mainMenuCount = 5;
 const char* motorMenuItems[] = { "Max timing", "Deadzone", "Accel rate", "Decay rate" };
 const int motorMenuCount = 4;
-const char* servoMenuItems[] = { "Servo min", "Servo max", "Reverse", "Center" };
-const int servoMenuCount = 4;
+const char* servoMenuItems[] = { "Servo min", "Servo max", "Reverse", "Center", "Deadzone" };
+const int servoMenuCount = 5;
 
 int menuIndex = 0;
 Screen prevMenu = SCR_MAIN_MENU;
@@ -242,6 +243,7 @@ void applyEdit() {
       case 1: cfg.servoMax = edit.intVal; break;
       case 2: cfg.servoReverse = edit.boolVal; break;
       case 3: cfg.servoCenter = edit.intVal; break;
+      case 4: cfg.steerDeadzone = edit.intVal; break;
     }
   }
 }
@@ -527,16 +529,16 @@ void loop() {
     lastR1 = r1Pressed;
 
     int rawAngle;
-    if (lxVal >= 0) {
-      // stick right: center → max
+    if (abs(lxVal) <= cfg.steerDeadzone) {
+      rawAngle = cfg.servoCenter;
+    } else if (lxVal > cfg.steerDeadzone) {
       rawAngle = cfg.servoReverse
-        ? map(lxVal, 0, 511, cfg.servoCenter, cfg.servoMin)
-        : map(lxVal, 0, 511, cfg.servoCenter, cfg.servoMax);
+        ? map(lxVal, cfg.steerDeadzone, 511, cfg.servoCenter, cfg.servoMin)
+        : map(lxVal, cfg.steerDeadzone, 511, cfg.servoCenter, cfg.servoMax);
     } else {
-      // stick left: center → min
       rawAngle = cfg.servoReverse
-        ? map(lxVal, -512, 0, cfg.servoMax, cfg.servoCenter)
-        : map(lxVal, -512, 0, cfg.servoMin, cfg.servoCenter);
+        ? map(lxVal, -512, -cfg.steerDeadzone, cfg.servoMax, cfg.servoCenter)
+        : map(lxVal, -512, -cfg.steerDeadzone, cfg.servoMin, cfg.servoCenter);
     }
     servoAngle = constrain(rawAngle, cfg.servoMin, cfg.servoMax);
 
@@ -646,6 +648,7 @@ void loop() {
           case 1: enterEditInt("Servo max", cfg.servoMax, 90, 180, 1); break;
           case 2: enterEditBool("Reverse", cfg.servoReverse); break;
           case 3: enterEditInt("Servo center", cfg.servoCenter, 80, 100, 1); break;
+          case 4: enterEditInt("Steer deadzone", cfg.steerDeadzone, 0, 100, 1); break;
         }
       }
       if (btn == 2) {
