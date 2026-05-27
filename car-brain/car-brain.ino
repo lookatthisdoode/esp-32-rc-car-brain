@@ -13,6 +13,16 @@
 #define ENC_DT 4
 #define ENC_BTN 5
 
+// ─── Main manu animation ────────────────────────────────────────────────────────────────────
+#define FRAME_DELAY 42
+#define FRAME_WIDTH 64
+#define FRAME_HEIGHT 64
+#define FRAME_COUNT (sizeof(mainMenuAnimation) / sizeof(mainMenuAnimation[0]))
+
+int animFrame = 0;
+unsigned long lastFrameTime = 0;
+
+// ─── Config ────────────────────────────────────────────────────────────────────
 struct Config {
   int maxTiming;
   int deadzone;
@@ -29,17 +39,15 @@ struct Config {
 const char* presetNames[] = { "Drive", "Drift", "Race" };
 // 1800 - lego gears start grinding and esp32 power can bounce, do not set > 1800!
 const Config presets[] = {
-  { 1200, 15, 10, 0.10f, 0.05f, 90, 0, 180, false },  // Drive, almost no drift
-  { 1350, 5, 10, 0.10f, 0.06f, 90, 0, 180, false },  // Drift, kind of smooth
-  { 1500,  5, 10, 0.50f, 0.15f, 90, 30, 150, false },  // Race, limited servo angle, spins too fast though
+  { 1200, 15, 30, 0.10f, 0.05f, 90, 0, 180, false },  // Drive, almost no drift
+  { 1350, 5, 30, 0.10f, 0.06f, 90, 0, 180, false },  // Drift, kind of smooth
+  { 1500,  5, 30, 0.50f, 0.15f, 90, 30, 150, false },  // Race, limited servo angle, spins too fast though
 };
 const int presetCount = 3;
 int currentPreset = 1;
 Config cfg = presets[1];
-
+// bool to change presets
 bool lastL1 = false, lastR1 = false;
-unsigned long presetAlertTime = 0;
-#define PRESET_ALERT_MS 1500
 
 // ─── OLED ────────────────────────────────────────────────────────────────────
 Adafruit_SSD1306 display(128, 64, &Wire, -1);
@@ -250,17 +258,6 @@ void applyEdit() {
 
 // ─── Display ─────────────────────────────────────────────────────────────────
 
-void drawCarIcon(int x, int y) {
-  // top-down car, ~12x20px
-  display.fillRect(x + 3, y, 6, 20, SSD1306_WHITE);       // body
-  display.fillRect(x, y + 2, 3, 5, SSD1306_WHITE);         // front-left wheel
-  display.fillRect(x + 9, y + 2, 3, 5, SSD1306_WHITE);     // front-right wheel
-  display.fillRect(x, y + 13, 3, 5, SSD1306_WHITE);        // rear-left wheel
-  display.fillRect(x + 9, y + 13, 3, 5, SSD1306_WHITE);    // rear-right wheel
-  display.fillRect(x + 4, y + 4, 4, 3, SSD1306_BLACK);     // windshield
-  display.fillRect(x + 4, y + 12, 4, 3, SSD1306_BLACK);    // rear window
-}
-
 void drawMotorBar(int x, int y, int w, int h, int signal) {
   display.drawRect(x, y, w, h, SSD1306_WHITE);
   float pct = (signal - 1000) / (float)(cfg.maxTiming - 1000);
@@ -326,37 +323,40 @@ void updateDriveDisplay() {
   display.setTextSize(1);
   display.setTextColor(SSD1306_WHITE);
   if (ctrlConnected) {
-    display.setCursor(0, 0);
-    display.printf("%s%s [%c]%s", presetNames[currentPreset], expMode ? " [EXP]" : "", gearChar(currentGear), handbrake ? " BRK" : "");
-    display.setCursor(0, 10);
-    display.printf("Motor: %4dus", motorSignal);
-    drawMotorBar(0, 19, 128, 8, motorSignal);
-    display.setCursor(0, 30);
-    display.printf("Steer: %3ddeg", servoAngle);
-    drawSteerBar(0, 39, 128, 8, servoAngle);
-    display.setCursor(0, 50);
-    display.printf("R2:%4d L2:%4d LX:%4d", r2Val, l2Val, lxVal);
-  } else {
-    // drawCarIcon(8, 22);
-    display.setTextSize(1);
-    display.setCursor(30, 8);
-    display.print("RC Car Ready");
-    display.setCursor(30, 22);
-    display.print("Waiting for");
-    display.setCursor(30, 32);
-    display.print("controller...");
-    display.drawLine(0, 50, 128, 50, SSD1306_WHITE);
-    display.setCursor(4, 54);
-    display.print("Click once for menu");
-  }
+    // ── Connected ─────────────────────────────────────────────
 
-  if (millis() - presetAlertTime < PRESET_ALERT_MS) {
-    display.fillRect(14, 18, 100, 28, SSD1306_BLACK);
-    display.drawRect(14, 18, 100, 28, SSD1306_WHITE);
+    // Preset name — big, top left
     display.setTextSize(2);
-    display.setCursor(20, 24);
-    display.printf("<%s>", presetNames[currentPreset]);
+    display.setCursor(0, 0);
+    display.print(presetNames[currentPreset]);
+
+    // Gear — big, top right
+    display.setTextSize(2);
+    display.setCursor(108, 0);
+    display.print(gearChar(currentGear));
+
+    // EXP + handbrake indicators small next to preset
     display.setTextSize(1);
+    display.setCursor(0, 18);
+    if (expMode)   display.print("EXP ");
+    if (handbrake) display.print("BRK");
+
+    // Motor bar
+    display.setCursor(0, 28);
+    display.print("Motor");
+    drawMotorBar(0, 37, 128, 8, motorSignal);
+
+    // Steer bar
+    display.setCursor(0, 48);
+    display.print("Steer");
+    drawSteerBar(0, 57, 128, 7, servoAngle);
+  } else {
+    unsigned long now = millis();
+    if (now - lastFrameTime >= FRAME_DELAY) {
+      animFrame = (animFrame + 1) % FRAME_COUNT;
+      lastFrameTime = now;
+    }
+    display.drawBitmap(32, 0, mainMenuAnimation[animFrame], FRAME_WIDTH, FRAME_HEIGHT, SSD1306_WHITE);
   }
 
   display.display();
@@ -430,7 +430,6 @@ void setup() {
     if (hasSplash) {
       display.drawBitmap(0, 0, splashBitmap, 128, 64, SSD1306_WHITE);
     } else {
-      drawCarIcon(58, 10);
       display.setTextSize(2);
       display.setCursor(20, 38);
       display.print("RC CAR");
@@ -518,12 +517,10 @@ void loop() {
     if (l1Pressed && !lastL1 && currentPreset > 0) {
       currentPreset--;
       cfg = presets[currentPreset];
-      presetAlertTime = millis();
     }
     if (r1Pressed && !lastR1 && currentPreset < presetCount - 1) {
       currentPreset++;
       cfg = presets[currentPreset];
-      presetAlertTime = millis();
     }
     lastL1 = l1Pressed;
     lastR1 = r1Pressed;
@@ -555,7 +552,12 @@ void loop() {
         smoothSignal = motorSignal;
       }
       if (motorSignal < 1000 + cfg.deadzone) motorSignal = 1000;
-      if (handbrake) motorSignal = 1000;
+      if (handbrake) {
+        motorSignal = 1000;
+        if (dualshock) dualshock->setRumble(80, 0); // weak motor only, less annoying
+      } else {
+        if (dualshock) dualshock->setRumble(0, 0);
+      }
     }
   } else {
     lxVal = ryVal = r2Val = l2Val = 0;
@@ -664,7 +666,6 @@ void loop() {
       if (btn == 1) {
         currentPreset = menuIndex;
         cfg = presets[currentPreset];
-        presetAlertTime = millis();
         currentScreen = SCR_DRIVE;
         menuIndex = 0;
       }
