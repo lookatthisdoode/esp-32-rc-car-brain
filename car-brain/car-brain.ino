@@ -19,10 +19,10 @@
 #define FRAME_HEIGHT 64
 #define FRAME_COUNT (sizeof(mainMenuAnimation) / sizeof(mainMenuAnimation[0]))
 
-int animFrame = 0;
-unsigned long lastFrameTime = 0;
+// ─── Timeout to exit from settings ──────────────────────────────────────────────────────────
+#define MENU_TIMEOUT_MS 10000
 
-// ─── Config ────────────────────────────────────────────────────────────────────
+// ─── Config ─────────────────────────────────────────────────────────────────────────────────
 struct Config {
   int maxTiming;
   int deadzone;
@@ -46,12 +46,12 @@ const Config presets[] = {
 const int presetCount = 3;
 int currentPreset = 1;
 Config cfg = presets[1];
-// bool to change presets
-bool lastL1 = false, lastR1 = false;
 
-// ─── OLED ────────────────────────────────────────────────────────────────────
+// ─── OLED related stuff ──────────────────────────────────────────────────────
 Adafruit_SSD1306 display(128, 64, &Wire, -1);
 const bool hasSplash = true;
+int animFrame = 0;
+unsigned long lastFrameTime = 0;
 
 // ─── Servo / ESC ─────────────────────────────────────────────────────────────
 Servo motorESC;
@@ -79,7 +79,6 @@ void onDisconnectedController(ControllerPtr ctl) {
 // ─── Shifter ─────────────────────────────────────────────────────────────────
 enum Gear { GEAR_D, GEAR_N, GEAR_R };
 Gear currentGear = GEAR_N;
-bool lastDpadUp = false, lastDpadDown = false;
 
 int gearToAngle(int g) {
   switch (g) {
@@ -105,14 +104,17 @@ int servoAngle = cfg.servoCenter;
 int shifterAngle = 90;
 bool expMode = false;
 bool handbrake = false;
-bool lastStartState = false;
+
 float smoothSignal = 1000;
 int   manualMotor     = 1000;
 int   manualServo     = 90;
 int   manualShifter   = 90;
 int   manualEditTarget = 0; // 0=motor, 1=steering, 2=shifter
 unsigned long lastActivityTime = 0;
-#define MENU_TIMEOUT_MS 10000
+// Controller bool flags
+bool lastL1 = false, lastR1 = false;
+bool lastDpadUp = false, lastDpadDown = false;
+bool lastStartState = false;
 
 // ─── Encoder  ─────────────────────────────────
 uint8_t stableRead(int pin) {
@@ -554,9 +556,6 @@ void loop() {
       if (motorSignal < 1000 + cfg.deadzone) motorSignal = 1000;
       if (handbrake) {
         motorSignal = 1000;
-        if (dualshock) dualshock->setRumble(80, 0); // weak motor only, less annoying
-      } else {
-        if (dualshock) dualshock->setRumble(0, 0);
       }
     }
   } else {
