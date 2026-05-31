@@ -2,7 +2,11 @@
 #include <Adafruit_SSD1306.h>
 #include <ESP32Servo.h>
 #include <Bluepad32.h>
+#include <WiFi.h>
+#include <WebSocketsServer_Generic.h>
+#include <ArduinoJson.h>
 #include "splash.h"
+
 // ─── Pins ────────────────────────────────────────────────────────────────────
 #define MOTOR_PIN 19
 #define SERVO_PIN 18
@@ -13,16 +17,31 @@
 #define ENC_DT 4
 #define ENC_BTN 5
 
-// ─── Main manu animation ────────────────────────────────────────────────────────────────────
+
+
+// ─── WebSocket ───────────────────────────────────────────────────────────────
+#define WS_PORT            81
+#define TELEM_INTERVAL_MS  150
+#define WS_CONTROL_TIMEOUT 50000
+
+WebSocketsServer webSocket(WS_PORT);
+unsigned long lastTelemTime  = 0;
+bool  wsClientConnected      = false;
+float wsThrottle             = 0;
+float wsSteer                = 0;
+bool  wsActive               = false;
+unsigned long lastWsControl  = 0;
+
+// ─── Main menu animation ────────────────────────────────────────────────────
 #define FRAME_DELAY 42
 #define FRAME_WIDTH 64
 #define FRAME_HEIGHT 64
 #define FRAME_COUNT (sizeof(mainMenuAnimation) / sizeof(mainMenuAnimation[0]))
 
-// ─── Timeout to exit from settings ──────────────────────────────────────────────────────────
+// ─── Timeout to exit from settings ──────────────────────────────────────────
 #define MENU_TIMEOUT_MS 10000
 
-// ─── Config ─────────────────────────────────────────────────────────────────────────────────
+// ─── Config ─────────────────────────────────────────────────────────────────
 struct Config {
   int maxTiming;
   int deadzone;
@@ -39,13 +58,25 @@ struct Config {
 const char* presetNames[] = { "Drive", "Drift", "Race" };
 // 1800 - lego gears start grinding and esp32 power can bounce, do not set > 1800!
 const Config presets[] = {
-  { 1200, 15, 30, 0.10f, 0.05f, 90, 0, 180, false },  // Drive, almost no drift
-  { 1350, 5, 30, 0.10f, 0.06f, 90, 0, 180, false },  // Drift, kind of smooth
-  { 1500,  5, 30, 0.50f, 0.15f, 90, 30, 150, false },  // Race, limited servo angle, spins too fast though
+  { 1200, 15, 30, 0.10f, 0.05f, 90, 0, 180, false },
+  { 1440, 5, 30, 0.22f, 0.05f, 90, 0, 180, false },
+  { 1500,  5, 30, 0.50f, 0.15f, 90, 30, 150, false },
 };
 const int presetCount = 3;
 int currentPreset = 1;
 Config cfg = presets[1];
+
+// WS config — loaded from console on WS connect
+Config wsConfig = { 1400, 5, 30, 0.20f, 0.08f, 90, 0, 180, false };
+Config preWsConfig;   // stash BT config to restore on WS disconnect
+int    preWsPreset;
+
+// LED colors per preset: Drive=green, Drift=yellow, Race=red
+const uint8_t presetColors[][3] = {
+  {   0, 255,   0 },
+  { 255, 180,   0 },
+  { 255,   0,   0 },
+};
 
 // ─── OLED related stuff ──────────────────────────────────────────────────────
 Adafruit_SSD1306 display(128, 64, &Wire, -1);
@@ -63,10 +94,59 @@ ControllerPtr dualshock;
 bool ctrlConnected = false;
 int lxVal = 0, ryVal = 0, r2Val = 0, l2Val = 0;
 
+// ─── Vroom rumble state machine ──────────────────────────────────────────────
+enum RumbleState { RUMBLE_IDLE, RUMBLE_VROOM1, RUMBLE_GAP, RUMBLE_VROOM2 };
+RumbleState  rumbleState = RUMBLE_IDLE;
+unsigned long rumbleTimer = 0;
+#define VROOM_ON_MS  150
+#define VROOM_GAP_MS  80
+
+void startVroom() {
+  rumbleState = RUMBLE_VROOM1;
+  rumbleTimer = millis();
+  if (dualshock) dualshock->playDualRumble(0, VROOM_ON_MS, 255, 255);
+}
+
+void updateVroom() {
+  if (rumbleState == RUMBLE_IDLE) return;
+  unsigned long now = millis();
+  switch (rumbleState) {
+    case RUMBLE_VROOM1:
+      if (now - rumbleTimer >= VROOM_ON_MS) {
+        rumbleState = RUMBLE_GAP;
+        rumbleTimer = now;
+        if (dualshock) dualshock->playDualRumble(0, VROOM_GAP_MS, 0, 0);
+      }
+      break;
+    case RUMBLE_GAP:
+      if (now - rumbleTimer >= VROOM_GAP_MS) {
+        rumbleState = RUMBLE_VROOM2;
+        rumbleTimer = now;
+        if (dualshock) dualshock->playDualRumble(0, VROOM_ON_MS, 255, 255);
+      }
+      break;
+    case RUMBLE_VROOM2:
+      if (now - rumbleTimer >= VROOM_ON_MS) {
+        rumbleState = RUMBLE_IDLE;
+      }
+      break;
+    default: break;
+  }
+}
+
+void applyLED() {
+  if (!dualshock) return;
+  dualshock->setColorLED(presetColors[currentPreset][0],
+                         presetColors[currentPreset][1],
+                         presetColors[currentPreset][2]);
+}
+
 void onConnectedController(ControllerPtr ctl) {
   Serial.println(">>> Controller connected!");
   dualshock = ctl;
   ctrlConnected = true;
+  applyLED();
+  startVroom();
 }
 
 void onDisconnectedController(ControllerPtr ctl) {
@@ -74,6 +154,18 @@ void onDisconnectedController(ControllerPtr ctl) {
   if (ctl == dualshock) dualshock = nullptr;
   ctrlConnected = false;
   lxVal = ryVal = r2Val = l2Val = 0;
+  rumbleState = RUMBLE_IDLE;
+}
+
+void disconnectController() {
+  if (dualshock && ctrlConnected) {
+    Serial.println("[WS] Disconnecting BT controller");
+    dualshock->disconnect();
+    dualshock = nullptr;
+    ctrlConnected = false;
+    lxVal = ryVal = r2Val = l2Val = 0;
+    rumbleState = RUMBLE_IDLE;
+  }
 }
 
 // ─── Shifter ─────────────────────────────────────────────────────────────────
@@ -109,12 +201,143 @@ float smoothSignal = 1000;
 int   manualMotor     = 1000;
 int   manualServo     = 90;
 int   manualShifter   = 90;
-int   manualEditTarget = 0; // 0=motor, 1=steering, 2=shifter
+int   manualEditTarget = 0;
 unsigned long lastActivityTime = 0;
-// Controller bool flags
+
 bool lastL1 = false, lastR1 = false;
 bool lastDpadUp = false, lastDpadDown = false;
 bool lastStartState = false;
+bool lastHandbrake = false;
+
+// ─── WebSocket handlers ──────────────────────────────────────────────────────
+void broadcastTelemetry() {
+  StaticJsonDocument<512> doc;
+  doc["type"]          = "telemetry";
+  doc["motor"]         = motorSignal;
+  doc["servo"]         = servoAngle;
+  doc["gear"]          = String(gearChar(currentGear));
+  doc["preset"]        = wsClientConnected ? "WS" : presetNames[currentPreset];
+  doc["presetIndex"]   = currentPreset;
+  doc["exp"]           = expMode;
+  doc["handbrake"]     = handbrake;
+  doc["maxTiming"]     = cfg.maxTiming;
+  doc["deadzone"]      = cfg.deadzone;
+  doc["steerDeadzone"] = cfg.steerDeadzone;
+  doc["servoCenter"]   = cfg.servoCenter;
+  doc["servoMin"]      = cfg.servoMin;
+  doc["servoMax"]      = cfg.servoMax;
+  doc["expAccelRate"]  = cfg.expAccelRate;
+  doc["expDecayRate"]  = cfg.expDecayRate;
+  doc["controller"]    = ctrlConnected;
+
+  String out;
+  serializeJson(doc, out);
+  webSocket.broadcastTXT(out);
+}
+
+void applyWsConfig(StaticJsonDocument<512>& doc) {
+  wsConfig.maxTiming     = doc["maxTiming"]     | wsConfig.maxTiming;
+  wsConfig.deadzone      = doc["deadzone"]      | wsConfig.deadzone;
+  wsConfig.steerDeadzone = doc["steerDeadzone"]  | wsConfig.steerDeadzone;
+  wsConfig.expAccelRate  = doc["expAccelRate"]   | wsConfig.expAccelRate;
+  wsConfig.expDecayRate  = doc["expDecayRate"]   | wsConfig.expDecayRate;
+  wsConfig.servoCenter   = doc["servoCenter"]    | wsConfig.servoCenter;
+  wsConfig.servoMin      = doc["servoMin"]       | wsConfig.servoMin;
+  wsConfig.servoMax      = doc["servoMax"]       | wsConfig.servoMax;
+  wsConfig.servoReverse  = doc["servoReverse"]   | wsConfig.servoReverse;
+  cfg = wsConfig;
+  Serial.println("[WS] Full config applied");
+}
+
+void handleWsCommand(uint8_t num, const char* payload) {
+  StaticJsonDocument<512> doc;
+  if (deserializeJson(doc, payload)) return;
+
+  const char* type = doc["type"];
+  if (!type) return;
+
+  if (strcmp(type, "control") == 0) {
+    wsThrottle = doc["throttle"] | 0.0f;
+    wsSteer    = doc["steer"]    | 0.0f;
+    handbrake  = doc["handbrake"] | false;
+    lastWsControl = millis();
+    wsActive = true;
+  }
+  else if (strcmp(type, "gear") == 0) {
+    const char* val = doc["value"];
+    if (val) {
+      switch (val[0]) {
+        case 'D': currentGear = GEAR_D; break;
+        case 'R': currentGear = GEAR_R; break;
+        default:  currentGear = GEAR_N; break;
+      }
+    }
+  }
+  else if (strcmp(type, "preset") == 0) {
+    const char* dir = doc["direction"];
+    if (dir) {
+      if (strcmp(dir, "next") == 0 && currentPreset < presetCount - 1) currentPreset++;
+      else if (strcmp(dir, "prev") == 0 && currentPreset > 0) currentPreset--;
+      cfg = presets[currentPreset];
+    }
+  }
+  else if (strcmp(type, "toggle") == 0) {
+    const char* feature = doc["feature"];
+    if (feature && strcmp(feature, "exp") == 0) {
+      expMode = !expMode;
+      smoothSignal = 1000;
+    }
+  }
+  else if (strcmp(type, "config") == 0) {
+    const char* key = doc["key"];
+    if (!key) return;
+    if (strcmp(key, "maxTiming") == 0)       cfg.maxTiming     = doc["value"] | cfg.maxTiming;
+    else if (strcmp(key, "deadzone") == 0)    cfg.deadzone      = doc["value"] | cfg.deadzone;
+    else if (strcmp(key, "steerDeadzone") == 0) cfg.steerDeadzone = doc["value"] | cfg.steerDeadzone;
+    else if (strcmp(key, "servoCenter") == 0) cfg.servoCenter   = doc["value"] | cfg.servoCenter;
+    else if (strcmp(key, "servoMin") == 0)    cfg.servoMin      = doc["value"] | cfg.servoMin;
+    else if (strcmp(key, "servoMax") == 0)    cfg.servoMax      = doc["value"] | cfg.servoMax;
+    else if (strcmp(key, "expAccelRate") == 0) cfg.expAccelRate  = doc["value"] | cfg.expAccelRate;
+    else if (strcmp(key, "expDecayRate") == 0) cfg.expDecayRate  = doc["value"] | cfg.expDecayRate;
+    wsConfig = cfg;
+    Serial.printf("[WS] Config %s updated\n", key);
+  }
+  else if (strcmp(type, "ws_config") == 0) {
+    applyWsConfig(doc);
+  }
+}
+
+void webSocketEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t length) {
+  switch (type) {
+    case WStype_CONNECTED:
+      Serial.printf("[WS] Client %u connected\n", num);
+      wsClientConnected = true;
+      // Stash current BT config, switch to WS config
+      preWsConfig = cfg;
+      preWsPreset = currentPreset;
+      cfg = wsConfig;
+      // Disconnect BT controller
+      disconnectController();
+      break;
+    case WStype_DISCONNECTED:
+      Serial.printf("[WS] Client %u disconnected\n", num);
+      wsClientConnected = false;
+      wsActive = false;
+      wsThrottle = 0;
+      wsSteer = 0;
+      motorSignal = 1000;
+      smoothSignal = 1000;
+      // Restore BT config
+      cfg = preWsConfig;
+      currentPreset = preWsPreset;
+      Serial.println("[WS] Restored BT config");
+      break;
+    case WStype_TEXT:
+      handleWsCommand(num, (const char*)payload);
+      break;
+    default: break;
+  }
+}
 
 // ─── Encoder  ─────────────────────────────────
 uint8_t stableRead(int pin) {
@@ -148,7 +371,7 @@ int readEncoder() {
 
   int delta = 0;
   unsigned long age = millis() - lastTick;
-  int threshold = (age < 80) ? 1 : 2; // 2:4 for less noise but less responsive
+  int threshold = (age < 80) ? 1 : 2;
 
   if (accum >=  threshold) { delta =  1; accum = 0; }
   if (accum <= -threshold) { delta = -1; accum = 0; }
@@ -161,7 +384,6 @@ unsigned long btnPressTime = 0;
 bool btnWasPressed = false;
 bool longPressHandled = false;
 
-// returns 1 = short click, 2 = long press, 0 = nothing
 int readButton() {
   bool pressed = (digitalRead(ENC_BTN) == LOW);
   int result = 0;
@@ -209,9 +431,7 @@ int menuIndex = 0;
 Screen prevMenu = SCR_MAIN_MENU;
 int editingItem = 0;
 
-enum EditType { EDIT_INT,
-                EDIT_FLOAT,
-                EDIT_BOOL };
+enum EditType { EDIT_INT, EDIT_FLOAT, EDIT_BOOL };
 
 struct EditState {
   const char* label;
@@ -324,31 +544,29 @@ void updateDriveDisplay() {
   display.clearDisplay();
   display.setTextSize(1);
   display.setTextColor(SSD1306_WHITE);
-  if (ctrlConnected) {
-    // ── Connected ─────────────────────────────────────────────
-
-    // Preset name — big, top left
+  if (ctrlConnected || wsActive) {
     display.setTextSize(2);
     display.setCursor(0, 0);
-    display.print(presetNames[currentPreset]);
+    if (wsClientConnected) {
+      display.print("WS");
+    } else {
+      display.print(presetNames[currentPreset]);
+    }
 
-    // Gear — big, top right
     display.setTextSize(2);
     display.setCursor(108, 0);
     display.print(gearChar(currentGear));
 
-    // EXP + handbrake indicators small next to preset
     display.setTextSize(1);
     display.setCursor(0, 18);
     if (expMode)   display.print("EXP ");
-    if (handbrake) display.print("BRK");
+    if (handbrake) display.print("BRK ");
+    if (wsActive)  display.print("WS");
 
-    // Motor bar
     display.setCursor(0, 28);
     display.print("Motor");
     drawMotorBar(0, 37, 128, 8, motorSignal);
 
-    // Steer bar
     display.setCursor(0, 48);
     display.print("Steer");
     drawSteerBar(0, 57, 128, 7, servoAngle);
@@ -419,7 +637,6 @@ void updateManualControl() {
 
 // ─── Setup ───────────────────────────────────────────────────────────────────
 void setup() {
-
   Serial.begin(115200);
 
   // OLED
@@ -440,7 +657,6 @@ void setup() {
     display.display();
   }
 
-
   // Encoder pins
   pinMode(ENC_CLK, INPUT_PULLUP);
   pinMode(ENC_DT, INPUT_PULLUP);
@@ -460,11 +676,29 @@ void setup() {
   shifterServo.attach(SHIFTER_PIN, 1000, 2000);
   shifterServo.write(90);
 
+  // WiFi
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  Serial.print("WiFi connecting");
+  unsigned long wifiStart = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - wifiStart < 8000) {
+    delay(250);
+    Serial.print(".");
+  }
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.printf("\nWiFi OK: %s\n", WiFi.localIP().toString().c_str());
+  } else {
+    Serial.println("\nWiFi failed");
+  }
+
+  // WebSocket server
+  webSocket.begin();
+  webSocket.onEvent(webSocketEvent);
+  Serial.printf("WebSocket server on port %d\n", WS_PORT);
 
   BP32.setup(&onConnectedController, &onDisconnectedController);
   BP32.forgetBluetoothKeys();
   Serial.println("=== Ready ===");
-};
+}
 
 // ─── Loop ────────────────────────────────────────────────────────────────────
 void loop() {
@@ -472,7 +706,23 @@ void loop() {
   int btn = readButton();
   if (delta != 0 || btn != 0) lastActivityTime = millis();
   BP32.update();
+  updateVroom();
+  webSocket.loop();
 
+  // WS control timeout
+  if (wsActive && millis() - lastWsControl > WS_CONTROL_TIMEOUT) {
+    wsActive = false;
+    wsThrottle = 0;
+    wsSteer = 0;
+  }
+
+  // Telemetry broadcast
+  if (wsClientConnected && millis() - lastTelemTime >= TELEM_INTERVAL_MS) {
+    lastTelemTime = millis();
+    broadcastTelemetry();
+  }
+
+  // Menu timeout
   if (currentScreen != SCR_DRIVE && millis() - lastActivityTime > MENU_TIMEOUT_MS) {
     if (currentScreen == SCR_MANUAL_CONTROL) {
       motorESC.writeMicroseconds(1000);
@@ -519,10 +769,12 @@ void loop() {
     if (l1Pressed && !lastL1 && currentPreset > 0) {
       currentPreset--;
       cfg = presets[currentPreset];
+      applyLED();
     }
     if (r1Pressed && !lastR1 && currentPreset < presetCount - 1) {
       currentPreset++;
       cfg = presets[currentPreset];
+      applyLED();
     }
     lastL1 = l1Pressed;
     lastR1 = r1Pressed;
@@ -558,6 +810,47 @@ void loop() {
         motorSignal = 1000;
       }
     }
+
+    // Handbrake rumble
+    if (handbrake != lastHandbrake) {
+      if (handbrake) {
+        if (dualshock) dualshock->playDualRumble(0, 65535, 80, 0);
+      } else {
+        if (dualshock) dualshock->playDualRumble(0, 0, 0, 0);
+      }
+      lastHandbrake = handbrake;
+    }
+
+  } else if (wsActive) {
+    // ── WebSocket remote control (when no gamepad) ──────────────────────────
+    if (expMode) {
+      int target = constrain(map((int)wsThrottle, 0, 100, 1000, cfg.maxTiming), 1000, cfg.maxTiming);
+      float stickPct = wsThrottle / 100.0f;
+      smoothSignal += (stickPct > 0.02f)
+                        ? (target - smoothSignal) * cfg.expAccelRate
+                        : (1000   - smoothSignal) * cfg.expDecayRate;
+      motorSignal = constrain((int)smoothSignal, 1000, cfg.maxTiming);
+    } else {
+      motorSignal = constrain(map((int)wsThrottle, 0, 100, 1000, cfg.maxTiming), 1000, cfg.maxTiming);
+      smoothSignal = motorSignal;
+    }
+    if (motorSignal < 1000 + cfg.deadzone) motorSignal = 1000;
+    // handle handbrake
+    if (handbrake) {
+      motorSignal = 1000;
+      smoothSignal = 1000;
+    }
+
+    int wsMapped;
+    if (wsSteer >= 0) {
+      wsMapped = map((int)wsSteer, 0, 100, cfg.servoCenter, cfg.servoMax);
+    } else {
+      wsMapped = map((int)wsSteer, -100, 0, cfg.servoMin, cfg.servoCenter);
+    }
+    servoAngle = constrain(wsMapped, cfg.servoMin, cfg.servoMax);
+
+    shifterAngle = gearToAngle(currentGear);
+
   } else {
     lxVal = ryVal = r2Val = l2Val = 0;
     motorSignal = 1000;
@@ -580,10 +873,7 @@ void loop() {
   switch (currentScreen) {
 
     case SCR_DRIVE:
-      if (btn == 1) {
-        currentScreen = SCR_MAIN_MENU;
-        menuIndex = 0;
-      }
+      if (btn == 1) { currentScreen = SCR_MAIN_MENU; menuIndex = 0; }
       updateDriveDisplay();
       break;
 
@@ -591,18 +881,9 @@ void loop() {
       menuIndex = constrain(menuIndex + delta, 0, mainMenuCount - 1);
       if (btn == 1) {
         switch (menuIndex) {
-          case 0:
-            currentScreen = SCR_MOTOR_MENU;
-            menuIndex = 0;
-            break;
-          case 1:
-            currentScreen = SCR_SERVO_MENU;
-            menuIndex = 0;
-            break;
-          case 2:
-            currentScreen = SCR_PRESET_MENU;
-            menuIndex = currentPreset;
-            break;
+          case 0: currentScreen = SCR_MOTOR_MENU; menuIndex = 0; break;
+          case 1: currentScreen = SCR_SERVO_MENU; menuIndex = 0; break;
+          case 2: currentScreen = SCR_PRESET_MENU; menuIndex = currentPreset; break;
           case 3: currentScreen = SCR_CTRL_MONITOR; break;
           case 4:
             currentScreen    = SCR_MANUAL_CONTROL;
@@ -613,10 +894,7 @@ void loop() {
             break;
         }
       }
-      if (btn == 2) {
-        currentScreen = SCR_DRIVE;
-        menuIndex = 0;
-      }
+      if (btn == 2) { currentScreen = SCR_DRIVE; menuIndex = 0; }
       if (currentScreen == SCR_MAIN_MENU)
         drawScrollMenu("Main Menu", mainMenuItems, mainMenuCount, menuIndex);
       break;
@@ -632,10 +910,7 @@ void loop() {
           case 3: enterEditFloat("Decay rate", cfg.expDecayRate, 0.01, 1.0, 0.01); break;
         }
       }
-      if (btn == 2) {
-        currentScreen = SCR_MAIN_MENU;
-        menuIndex = 0;
-      }
+      if (btn == 2) { currentScreen = SCR_MAIN_MENU; menuIndex = 0; }
       if (currentScreen == SCR_MOTOR_MENU)
         drawScrollMenu("Motor", motorMenuItems, motorMenuCount, menuIndex);
       break;
@@ -652,10 +927,7 @@ void loop() {
           case 4: enterEditInt("Steer deadzone", cfg.steerDeadzone, 0, 100, 1); break;
         }
       }
-      if (btn == 2) {
-        currentScreen = SCR_MAIN_MENU;
-        menuIndex = 0;
-      }
+      if (btn == 2) { currentScreen = SCR_MAIN_MENU; menuIndex = 0; }
       if (currentScreen == SCR_SERVO_MENU)
         drawScrollMenu("Servo", servoMenuItems, servoMenuCount, menuIndex);
       break;
@@ -665,25 +937,20 @@ void loop() {
       if (btn == 1) {
         currentPreset = menuIndex;
         cfg = presets[currentPreset];
+        applyLED();
         currentScreen = SCR_DRIVE;
         menuIndex = 0;
       }
-      if (btn == 2) {
-        currentScreen = SCR_MAIN_MENU;
-        menuIndex = 2;
-      }
+      if (btn == 2) { currentScreen = SCR_MAIN_MENU; menuIndex = 2; }
       if (currentScreen == SCR_PRESET_MENU)
         drawScrollMenu("Mode", presetNames, presetCount, menuIndex);
       break;
 
     case SCR_CTRL_MONITOR:
-      if (btn == 2) {
-        currentScreen = SCR_MAIN_MENU;
-        menuIndex = 3;
-      }
+      if (btn == 2) { currentScreen = SCR_MAIN_MENU; menuIndex = 3; }
       updateCtrlMonitor();
       break;
-    
+
     case SCR_MANUAL_CONTROL:
       if (delta != 0) {
         switch (manualEditTarget) {
@@ -713,19 +980,11 @@ void loop() {
         } else if (edit.type == EDIT_BOOL)
           edit.boolVal = !edit.boolVal;
       }
-      if (btn == 1) {
-        applyEdit();
-        currentScreen = prevMenu;
-        menuIndex = editingItem;
-      }
-      if (btn == 2) {
-        currentScreen = prevMenu;
-        menuIndex = editingItem;
-      }
+      if (btn == 1) { applyEdit(); currentScreen = prevMenu; menuIndex = editingItem; }
+      if (btn == 2) { currentScreen = prevMenu; menuIndex = editingItem; }
       drawEditScreen();
       break;
   }
 
-  delay(10);
+  delay(5);
 }
-
