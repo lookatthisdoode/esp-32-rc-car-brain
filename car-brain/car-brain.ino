@@ -3,54 +3,66 @@
 #include <ESP32Servo.h>
 #include <Bluepad32.h>
 #include "splash.h"
+
 // ─── Pins ────────────────────────────────────────────────────────────────────
-#define MOTOR_PIN 19
-#define SERVO_PIN 18
+#define MOTOR_PIN   19
+#define SERVO_PIN   18
 #define SHIFTER_PIN 23
-#define OLED_SDA 21
-#define OLED_SCL 22
-#define ENC_CLK 15
-#define ENC_DT 4
-#define ENC_BTN 5
+#define OLED_SDA    21
+#define OLED_SCL    22
+#define ENC_CLK     15
+#define ENC_DT       4
+#define ENC_BTN      5
 
-// ─── Main manu animation ────────────────────────────────────────────────────────────────────
-#define FRAME_DELAY 42
-#define FRAME_WIDTH 64
+// ─── Animation ───────────────────────────────────────────────────────────────
+#define FRAME_DELAY  42
+#define FRAME_WIDTH  64
 #define FRAME_HEIGHT 64
-#define FRAME_COUNT (sizeof(mainMenuAnimation) / sizeof(mainMenuAnimation[0]))
+#define FRAME_COUNT  (sizeof(mainMenuAnimation) / sizeof(mainMenuAnimation[0]))
 
-// ─── Timeout to exit from settings ──────────────────────────────────────────────────────────
+// ─── Timeouts ────────────────────────────────────────────────────────────────
 #define MENU_TIMEOUT_MS 10000
 
-// ─── Config ─────────────────────────────────────────────────────────────────────────────────
+// ─── Button edge detector ────────────────────────────────────────────────────
+struct Button {
+  bool _last = false;
+  bool pressed(bool current)  { bool e = current && !_last; _last = current; return e; }
+  bool released(bool current) { bool e = !current && _last; _last = current; return e; }
+  void update(bool current)   { _last = current; }
+};
+
+// ─── Config ──────────────────────────────────────────────────────────────────
 struct Config {
-  int maxTiming;
-  int deadzone;
-  int steerDeadzone;
+  const char* name;
+  int   maxTiming;
+  int   deadzone;
+  int   steerDeadzone;
   float expAccelRate;
   float expDecayRate;
-  int servoCenter;
-  int servoMin;
-  int servoMax;
-  bool servoReverse;
+  int   servoCenter;
+  int   servoMin;
+  int   servoMax;
+  bool  servoReverse;
+  uint8_t colorR, colorG, colorB;
 };
 
 // ─── Presets ─────────────────────────────────────────────────────────────────
-const char* presetNames[] = { "Drive", "Drift", "Race" };
 // 1800 - lego gears start grinding and esp32 power can bounce, do not set > 1800!
 const Config presets[] = {
-  { 1200, 15, 30, 0.10f, 0.05f, 90, 0, 180, false },  // Drive, almost no drift
-  { 1350, 5, 30, 0.10f, 0.06f, 90, 0, 180, false },  // Drift, kind of smooth
-  { 1500,  5, 30, 0.50f, 0.15f, 90, 30, 150, false },  // Race, limited servo angle, spins too fast though
+  //  NAME      MAXTIMING   DEADZONE    STEERDZ   ACCRATE   DECRATE   SERVOCENTER   SERVOMIN    SERVOMAX    SERVOREVERSE    COLOR:R   COLOR:G   COLOR:B
+  {   "Drive",  1200,       15,         30,       0.10f,    0.05f,    90,           0,          180,        false,          255,      180,      0       },
+  {   "Drift",  1430,       5,          30,       0.21f,    0.05f,    90,           0,          180,        false,          199,      77,       155     },
+  {   "Race",   1500,       5,          30,       0.50f,    0.15f,    90,           30,         150,        false,          255,      0,        0       },
 };
-const int presetCount = 3;
-int currentPreset = 1;
-Config cfg = presets[1];
+const int presetCount = sizeof(presets) / sizeof(presets[0]);
+int    currentPreset  = 1;
+// load Drift as default
+Config cfg            = presets[1];
 
-// ─── OLED related stuff ──────────────────────────────────────────────────────
+// ─── OLED ────────────────────────────────────────────────────────────────────
 Adafruit_SSD1306 display(128, 64, &Wire, -1);
-const bool hasSplash = true;
-int animFrame = 0;
+const bool hasSplash  = true;
+int        animFrame  = 0;
 unsigned long lastFrameTime = 0;
 
 // ─── Servo / ESC ─────────────────────────────────────────────────────────────
@@ -61,12 +73,58 @@ Servo shifterServo;
 // ─── Bluepad32 ───────────────────────────────────────────────────────────────
 ControllerPtr dualshock;
 bool ctrlConnected = false;
-int lxVal = 0, ryVal = 0, r2Val = 0, l2Val = 0;
+int  lxVal = 0, ryVal = 0, r2Val = 0, l2Val = 0;
+
+// ─── Vroom rumble state machine ───────────────────────────────────────────────
+// Could be better :)
+enum RumbleState { RUMBLE_IDLE, RUMBLE_VROOM1, RUMBLE_GAP, RUMBLE_VROOM2 };
+RumbleState   rumbleState = RUMBLE_IDLE;
+unsigned long rumbleTimer = 0;
+#define VROOM_ON_MS  150
+#define VROOM_GAP_MS  80
+
+void startVroom() {
+  rumbleState = RUMBLE_VROOM1;
+  rumbleTimer = millis();
+  if (dualshock) dualshock->playDualRumble(0, VROOM_ON_MS, 255, 255);
+}
+
+void updateVroom() {
+  if (rumbleState == RUMBLE_IDLE) return;
+  unsigned long now = millis();
+  switch (rumbleState) {
+    case RUMBLE_VROOM1:
+      if (now - rumbleTimer >= VROOM_ON_MS) {
+        rumbleState = RUMBLE_GAP;
+        rumbleTimer = now;
+        if (dualshock) dualshock->playDualRumble(0, VROOM_GAP_MS, 0, 0);
+      }
+      break;
+    case RUMBLE_GAP:
+      if (now - rumbleTimer >= VROOM_GAP_MS) {
+        rumbleState = RUMBLE_VROOM2;
+        rumbleTimer = now;
+        if (dualshock) dualshock->playDualRumble(0, VROOM_ON_MS, 255, 255);
+      }
+      break;
+    case RUMBLE_VROOM2:
+      if (now - rumbleTimer >= VROOM_ON_MS) rumbleState = RUMBLE_IDLE;
+      break;
+    default: break;
+  }
+}
+
+void applyLED() {
+  if (!dualshock) return;
+  dualshock->setColorLED(cfg.colorR, cfg.colorG, cfg.colorB);
+}
 
 void onConnectedController(ControllerPtr ctl) {
   Serial.println(">>> Controller connected!");
-  dualshock = ctl;
+  dualshock     = ctl;
   ctrlConnected = true;
+  applyLED();
+  startVroom();
 }
 
 void onDisconnectedController(ControllerPtr ctl) {
@@ -74,6 +132,7 @@ void onDisconnectedController(ControllerPtr ctl) {
   if (ctl == dualshock) dualshock = nullptr;
   ctrlConnected = false;
   lxVal = ryVal = r2Val = l2Val = 0;
+  rumbleState = RUMBLE_IDLE;
 }
 
 // ─── Shifter ─────────────────────────────────────────────────────────────────
@@ -98,25 +157,25 @@ char gearChar(int g) {
   return '?';
 }
 
-// ─── Global state ────────────────────────────────────────────────────────────
-int motorSignal = 1000;
-int servoAngle = cfg.servoCenter;
-int shifterAngle = 90;
-bool expMode = false;
-bool handbrake = false;
-
+// ─── Global state ─────────────────────────────────────────────────────────────
+int   motorSignal  = 1000;
+int   servoAngle   = cfg.servoCenter;
+int   shifterAngle = 90;
+bool  expMode      = false;
+bool  handbrake    = false;
 float smoothSignal = 1000;
-int   manualMotor     = 1000;
-int   manualServo     = 90;
-int   manualShifter   = 90;
-int   manualEditTarget = 0; // 0=motor, 1=steering, 2=shifter
-unsigned long lastActivityTime = 0;
-// Controller bool flags
-bool lastL1 = false, lastR1 = false;
-bool lastDpadUp = false, lastDpadDown = false;
-bool lastStartState = false;
 
-// ─── Encoder  ─────────────────────────────────
+int   manualMotor      = 1000;
+int   manualServo      = 90;
+int   manualShifter    = 90;
+int   manualEditTarget = 0;
+
+unsigned long lastActivityTime = 0;
+
+// ─── Controller buttons ───────────────────────────────────────────────────────
+Button btnL1, btnR1, btnDpadUp, btnDpadDown, btnStart, btnHandbrake;
+
+// ─── Encoder ──────────────────────────────────────────────────────────────────
 uint8_t stableRead(int pin) {
   uint8_t count = 0;
   for (int i = 0; i < 3; i++) {
@@ -127,9 +186,9 @@ uint8_t stableRead(int pin) {
 }
 
 int readEncoder() {
-  static uint8_t prevState = 3;
-  static int     accum     = 0;
-  static unsigned long lastTick = 0;
+  static uint8_t prevState  = 3;
+  static int     accum      = 0;
+  static unsigned long lastTick   = 0;
   static unsigned long lastChange = 0;
 
   uint8_t clk   = stableRead(ENC_CLK);
@@ -141,33 +200,32 @@ int readEncoder() {
     if (prevState == 1 && state == 0) accum++;
     if (prevState == 3 && state == 2) accum--;
     if (prevState == 2 && state == 0) accum--;
-    prevState = state;
+    prevState  = state;
     lastChange = millis();
-    lastTick = millis();
+    lastTick   = millis();
   }
 
   int delta = 0;
   unsigned long age = millis() - lastTick;
-  int threshold = (age < 80) ? 1 : 2; // 2:4 for less noise but less responsive
-
+  int threshold = (age < 80) ? 1 : 2;
   if (accum >=  threshold) { delta =  1; accum = 0; }
   if (accum <= -threshold) { delta = -1; accum = 0; }
   return delta;
 }
 
-// ─── Button — debounce + long press ──────────────────────────────────────────
-#define LONG_PRESS_MS 800
-unsigned long btnPressTime = 0;
-bool btnWasPressed = false;
-bool longPressHandled = false;
+// ─── Encoder button — debounce + long press ───────────────────────────────────
+#define LONG_PRESS_MS  800
+unsigned long btnPressTime     = 0;
+bool          btnWasPressed    = false;
+bool          longPressHandled = false;
 
 // returns 1 = short click, 2 = long press, 0 = nothing
 int readButton() {
   bool pressed = (digitalRead(ENC_BTN) == LOW);
-  int result = 0;
+  int  result  = 0;
   if (pressed && !btnWasPressed) {
-    btnPressTime = millis();
-    btnWasPressed = true;
+    btnPressTime     = millis();
+    btnWasPressed    = true;
     longPressHandled = false;
   }
   if (pressed && btnWasPressed && !longPressHandled) {
@@ -184,55 +242,42 @@ int readButton() {
   return result;
 }
 
-// ─── Menu ────────────────────────────────────────────────────────────────────
+// ─── Screens ──────────────────────────────────────────────────────────────────
 enum Screen {
   SCR_DRIVE,
   SCR_MAIN_MENU,
   SCR_MOTOR_MENU,
   SCR_SERVO_MENU,
-  SCR_PRESET_MENU,
   SCR_CTRL_MONITOR,
   SCR_MANUAL_CONTROL,
   SCR_EDIT_VALUE
 };
-
 Screen currentScreen = SCR_DRIVE;
 
-const char* mainMenuItems[] = { "Motor", "Servo", "Mode", "Controller", "Manual Control" };
-const int mainMenuCount = 5;
-const char* motorMenuItems[] = { "Max timing", "Deadzone", "Accel rate", "Decay rate" };
-const int motorMenuCount = 4;
-const char* servoMenuItems[] = { "Servo min", "Servo max", "Reverse", "Center", "Deadzone" };
-const int servoMenuCount = 5;
-
-int menuIndex = 0;
-Screen prevMenu = SCR_MAIN_MENU;
-int editingItem = 0;
-
-enum EditType { EDIT_INT,
-                EDIT_FLOAT,
-                EDIT_BOOL };
-
+// ─── Edit state ───────────────────────────────────────────────────────────────
+enum EditType { EDIT_INT, EDIT_FLOAT, EDIT_BOOL };
 struct EditState {
   const char* label;
-  EditType type;
-  int intVal, intMin, intMax, intStep;
+  EditType    type;
+  int   intVal,   intMin,   intMax,   intStep;
   float floatVal, floatMin, floatMax, floatStep;
-  bool boolVal;
+  bool  boolVal;
 } edit;
+
+Screen prevMenu    = SCR_MAIN_MENU;
+int    editingItem = 0;
+int    menuIndex   = 0;
 
 void enterEditInt(const char* label, int val, int mn, int mx, int step) {
   edit = { label, EDIT_INT, val, mn, mx, step, 0, 0, 0, 0, false };
   prevMenu = currentScreen;
   currentScreen = SCR_EDIT_VALUE;
 }
-
 void enterEditFloat(const char* label, float val, float mn, float mx, float step) {
   edit = { label, EDIT_FLOAT, 0, 0, 0, 0, val, mn, mx, step, false };
   prevMenu = currentScreen;
   currentScreen = SCR_EDIT_VALUE;
 }
-
 void enterEditBool(const char* label, bool val) {
   edit = { label, EDIT_BOOL, 0, 0, 0, 0, 0, 0, 0, 0, val };
   prevMenu = currentScreen;
@@ -242,37 +287,44 @@ void enterEditBool(const char* label, bool val) {
 void applyEdit() {
   if (prevMenu == SCR_MOTOR_MENU) {
     switch (editingItem) {
-      case 0: cfg.maxTiming = edit.intVal; break;
-      case 1: cfg.deadzone = edit.intVal; break;
+      case 0: cfg.maxTiming    = edit.intVal;   break;
+      case 1: cfg.deadzone     = edit.intVal;   break;
       case 2: cfg.expAccelRate = edit.floatVal; break;
       case 3: cfg.expDecayRate = edit.floatVal; break;
     }
   } else if (prevMenu == SCR_SERVO_MENU) {
     switch (editingItem) {
-      case 0: cfg.servoMin = edit.intVal; break;
-      case 1: cfg.servoMax = edit.intVal; break;
-      case 2: cfg.servoReverse = edit.boolVal; break;
-      case 3: cfg.servoCenter = edit.intVal; break;
-      case 4: cfg.steerDeadzone = edit.intVal; break;
+      case 0: cfg.servoMin      = edit.intVal;  break;
+      case 1: cfg.servoMax      = edit.intVal;  break;
+      case 2: cfg.servoReverse  = edit.boolVal; break;
+      case 3: cfg.servoCenter   = edit.intVal;  break;
+      case 4: cfg.steerDeadzone = edit.intVal;  break;
     }
   }
 }
 
-// ─── Display ─────────────────────────────────────────────────────────────────
+// ─── Menu item lists ──────────────────────────────────────────────────────────
+const char* mainMenuItems[]  = { "Motor", "Servo", "Controller", "Manual" };
+const int   mainMenuCount    = 4;
+const char* motorMenuItems[] = { "Max timing", "Deadzone", "Accel rate", "Decay rate" };
+const int   motorMenuCount   = 4;
+const char* servoMenuItems[] = { "Servo min", "Servo max", "Reverse", "Center", "Steer DZ" };
+const int   servoMenuCount   = 5;
 
+// ─── Display helpers ──────────────────────────────────────────────────────────
 void drawMotorBar(int x, int y, int w, int h, int signal) {
   display.drawRect(x, y, w, h, SSD1306_WHITE);
-  float pct = (signal - 1000) / (float)(cfg.maxTiming - 1000);
-  int fill = constrain((int)(pct * (w - 4)), 0, w - 4);
+  float pct  = (signal - 1000) / (float)(cfg.maxTiming - 1000);
+  int   fill = constrain((int)(pct * (w - 4)), 0, w - 4);
   if (fill > 0) display.fillRect(x + 2, y + 2, fill, h - 4, SSD1306_WHITE);
 }
 
 void drawSteerBar(int x, int y, int w, int h, int angle) {
   display.drawRect(x, y, w, h, SSD1306_WHITE);
   int blobW = 5;
-  int pos = cfg.servoReverse
-              ? map(angle, cfg.servoMax, cfg.servoMin, x + 2, x + w - 2 - blobW)
-              : map(angle, cfg.servoMin, cfg.servoMax, x + 2, x + w - 2 - blobW);
+  int pos   = cfg.servoReverse
+    ? map(angle, cfg.servoMax, cfg.servoMin, x + 2, x + w - 2 - blobW)
+    : map(angle, cfg.servoMin, cfg.servoMax, x + 2, x + w - 2 - blobW);
   pos = constrain(pos, x + 2, x + w - 2 - blobW);
   display.fillRect(pos, y + 1, blobW, h - 2, SSD1306_WHITE);
 }
@@ -280,14 +332,14 @@ void drawSteerBar(int x, int y, int w, int h, int angle) {
 void drawScrollMenu(const char* title, const char** items, int count, int selected) {
   display.clearDisplay();
   display.setTextSize(1);
-  display.fillRect(0, 0, 128, 10, SSD1306_WHITE);
+  display.fillRect(0, 0, 128, 11, SSD1306_WHITE);
   display.setTextColor(SSD1306_BLACK);
-  display.setCursor(2, 1);
+  display.setCursor(4, 2);
   display.print(title);
   display.setTextColor(SSD1306_WHITE);
   int start = max(0, min(selected, count - 4));
   for (int i = start; i < min(start + 4, count); i++) {
-    int y = 12 + (i - start) * 13;
+    int y = 13 + (i - start) * 13;
     if (i == selected) {
       display.fillRect(0, y - 1, 128, 12, SSD1306_WHITE);
       display.setTextColor(SSD1306_BLACK);
@@ -302,56 +354,55 @@ void drawScrollMenu(const char* title, const char** items, int count, int select
 }
 
 void drawEditScreen() {
+  // edit values screen
   display.clearDisplay();
   display.setTextSize(1);
-  display.fillRect(0, 0, 128, 10, SSD1306_WHITE);
+  display.fillRect(0, 0, 128, 11, SSD1306_WHITE);
   display.setTextColor(SSD1306_BLACK);
-  display.setCursor(2, 1);
+  display.setCursor(4, 2);
   display.print(edit.label);
   display.setTextColor(SSD1306_WHITE);
   display.setTextSize(2);
-  display.setCursor(10, 22);
-  if (edit.type == EDIT_INT) display.printf("%d", edit.intVal);
+  display.setCursor(20, 24);
+  if      (edit.type == EDIT_INT)   display.printf("%d",   edit.intVal);
   else if (edit.type == EDIT_FLOAT) display.printf("%.2f", edit.floatVal);
-  else display.print(edit.boolVal ? "YES" : "NO");
+  else                              display.print(edit.boolVal ? "YES" : "NO");
   display.setTextSize(1);
-  display.setCursor(2, 54);
-  display.print("click=save  long=back");
+  display.fillRect(0, 55, 128, 9, SSD1306_WHITE);
+  display.setTextColor(SSD1306_BLACK);
+  display.setCursor(4, 56);
+  display.print("[Save]");
+  display.setCursor(87, 56);
+  display.print("[Back]");
+  display.setTextColor(SSD1306_WHITE);
   display.display();
 }
 
 void updateDriveDisplay() {
   display.clearDisplay();
-  display.setTextSize(1);
   display.setTextColor(SSD1306_WHITE);
-  if (ctrlConnected) {
-    // ── Connected ─────────────────────────────────────────────
 
-    // Preset name — big, top left
+  if (ctrlConnected) {
     display.setTextSize(2);
     display.setCursor(0, 0);
-    display.print(presetNames[currentPreset]);
+    display.print(presets[currentPreset].name);
 
-    // Gear — big, top right
-    display.setTextSize(2);
     display.setCursor(108, 0);
     display.print(gearChar(currentGear));
 
-    // EXP + handbrake indicators small next to preset
     display.setTextSize(1);
     display.setCursor(0, 18);
     if (expMode)   display.print("EXP ");
     if (handbrake) display.print("BRK");
 
-    // Motor bar
     display.setCursor(0, 28);
     display.print("Motor");
     drawMotorBar(0, 37, 128, 8, motorSignal);
 
-    // Steer bar
     display.setCursor(0, 48);
     display.print("Steer");
     drawSteerBar(0, 57, 128, 7, servoAngle);
+
   } else {
     unsigned long now = millis();
     if (now - lastFrameTime >= FRAME_DELAY) {
@@ -367,19 +418,19 @@ void updateDriveDisplay() {
 void updateCtrlMonitor() {
   display.clearDisplay();
   display.setTextSize(1);
-  display.fillRect(0, 0, 128, 10, SSD1306_WHITE);
+  display.fillRect(0, 0, 128, 11, SSD1306_WHITE);
   display.setTextColor(SSD1306_BLACK);
-  display.setCursor(2, 1);
+  display.setCursor(4, 2);
   display.print("Controller");
   display.setTextColor(SSD1306_WHITE);
   if (ctrlConnected) {
-    display.setCursor(0, 13);
+    display.setCursor(0, 14);
     display.printf("LX:%5d  RY:%5d", lxVal, ryVal);
-    display.setCursor(0, 24);
+    display.setCursor(0, 25);
     display.printf("R2:%5d  L2:%5d", r2Val, l2Val);
-    display.setCursor(0, 35);
+    display.setCursor(0, 36);
     display.printf("EXP:%-3s  Gear:[%c]", expMode ? "ON" : "OFF", gearChar(currentGear));
-    display.setCursor(0, 46);
+    display.setCursor(0, 47);
     display.printf("Brake: %s", handbrake ? "ON" : "OFF");
   } else {
     display.setCursor(4, 28);
@@ -394,35 +445,34 @@ void updateManualControl() {
   const char* targetNames[] = { "MOTOR", "STEER", "SHIFT" };
   display.clearDisplay();
   display.setTextSize(1);
-  display.fillRect(0, 0, 128, 10, SSD1306_WHITE);
+  display.fillRect(0, 0, 128, 11, SSD1306_WHITE);
   display.setTextColor(SSD1306_BLACK);
-  display.setCursor(2, 1);
+  display.setCursor(4, 2);
   display.printf("Manual [%s]", targetNames[manualEditTarget]);
   display.setTextColor(SSD1306_WHITE);
 
-  display.setCursor(0, 13);
+  display.setCursor(0, 14);
   display.printf("Motor: %4d", manualMotor);
   if (manualEditTarget == 0) display.print(" <");
-  drawMotorBar(0, 22, 128, 8, manualMotor);
+  drawMotorBar(0, 23, 128, 8, manualMotor);
 
-  display.setCursor(0, 33);
+  display.setCursor(0, 34);
   display.printf("Steer: %3ddeg", manualServo);
   if (manualEditTarget == 1) display.print(" <");
-  drawSteerBar(0, 42, 128, 8, manualServo);
+  drawSteerBar(0, 43, 128, 8, manualServo);
 
-  display.setCursor(0, 53);
+  display.setCursor(0, 54);
   display.printf("Shift: %3ddeg", manualShifter);
   if (manualEditTarget == 2) display.print(" <");
 
   display.display();
 }
 
-// ─── Setup ───────────────────────────────────────────────────────────────────
+// ─── Setup ────────────────────────────────────────────────────────────────────
 void setup() {
-
   Serial.begin(115200);
 
-  // OLED
+  // Connect and init screen, draw splash screen
   Wire.begin(OLED_SDA, OLED_SCL);
   if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
     Serial.println("OLED failed");
@@ -432,6 +482,7 @@ void setup() {
     if (hasSplash) {
       display.drawBitmap(0, 0, splashBitmap, 128, 64, SSD1306_WHITE);
     } else {
+      // Fallback if image not present
       display.setTextSize(2);
       display.setCursor(20, 38);
       display.print("RC CAR");
@@ -440,39 +491,38 @@ void setup() {
     display.display();
   }
 
-
-  // Encoder pins
+  // Init encoder
   pinMode(ENC_CLK, INPUT_PULLUP);
-  pinMode(ENC_DT, INPUT_PULLUP);
+  pinMode(ENC_DT,  INPUT_PULLUP);
   pinMode(ENC_BTN, INPUT_PULLUP);
-  Serial.printf("Boot state — CLK:%d DT:%d\n", digitalRead(ENC_CLK), digitalRead(ENC_DT));
 
-  // ESC arm
+  // Arm motor and servos
   motorESC.attach(MOTOR_PIN, 1000, 2000);
   motorESC.writeMicroseconds(1000);
-  delay(2000);
 
-  // Servo
   steeringServo.attach(SERVO_PIN, 1000, 2000);
   steeringServo.write(cfg.servoCenter);
 
-  // Shifter servo
   shifterServo.attach(SHIFTER_PIN, 1000, 2000);
   shifterServo.write(90);
 
-
+  // Init BT and clear old keys (This esp can not save anything for some reason anyway)
   BP32.setup(&onConnectedController, &onDisconnectedController);
   BP32.forgetBluetoothKeys();
-  Serial.println("=== Ready ===");
-};
 
-// ─── Loop ────────────────────────────────────────────────────────────────────
+  Serial.println("=== Ready ===");
+}
+
+// ─── Loop ─────────────────────────────────────────────────────────────────────
 void loop() {
   int delta = readEncoder();
-  int btn = readButton();
+  int btn   = readButton();
   if (delta != 0 || btn != 0) lastActivityTime = millis();
-  BP32.update();
 
+  BP32.update();
+  updateVroom();
+
+  // Menu timeout — return to drive
   if (currentScreen != SCR_DRIVE && millis() - lastActivityTime > MENU_TIMEOUT_MS) {
     if (currentScreen == SCR_MANUAL_CONTROL) {
       motorESC.writeMicroseconds(1000);
@@ -483,49 +533,40 @@ void loop() {
     menuIndex = 0;
   }
 
-  // ── Controller input ─────────────────────────────────────────────────────
+  // ── Controller input ──────────────────────────────────────────────────────
   if (ctrlConnected && dualshock && dualshock->isConnected()) {
     lxVal = dualshock->axisX();
     ryVal = dualshock->axisRY();
     r2Val = dualshock->throttle();
     l2Val = dualshock->brake();
 
-    bool startPressed = dualshock->miscStart();
-    if (startPressed && !lastStartState) {
+    if (btnStart.pressed(dualshock->miscStart())) {
       expMode = !expMode;
       smoothSignal = 1000;
-      Serial.printf("Exp mode: %s\n", expMode ? "ON" : "OFF");
     }
-    lastStartState = startPressed;
 
-    bool dpadUp = dualshock->dpad() & DPAD_UP;
-    bool dpadDown = dualshock->dpad() & DPAD_DOWN;
-    if (dpadUp && !lastDpadUp) {
-      if (currentGear == GEAR_R) currentGear = GEAR_N;
+    if (btnDpadUp.pressed(dualshock->dpad() & DPAD_UP)) {
+      if      (currentGear == GEAR_R) currentGear = GEAR_N;
       else if (currentGear == GEAR_N) currentGear = GEAR_D;
     }
-    if (dpadDown && !lastDpadDown) {
-      if (currentGear == GEAR_D) currentGear = GEAR_N;
+    if (btnDpadDown.pressed(dualshock->dpad() & DPAD_DOWN)) {
+      if      (currentGear == GEAR_D) currentGear = GEAR_N;
       else if (currentGear == GEAR_N) currentGear = GEAR_R;
     }
-    lastDpadUp = dpadUp;
-    lastDpadDown = dpadDown;
 
     shifterAngle = gearToAngle(currentGear);
-    handbrake = l2Val > 50;
+    handbrake    = l2Val > 50;
 
-    bool l1Pressed = dualshock->buttons() & BUTTON_SHOULDER_L;
-    bool r1Pressed = dualshock->buttons() & BUTTON_SHOULDER_R;
-    if (l1Pressed && !lastL1 && currentPreset > 0) {
-      currentPreset--;
-      cfg = presets[currentPreset];
+    if (btnL1.pressed(dualshock->buttons() & BUTTON_SHOULDER_L)) {
+      if (currentPreset > 0) { currentPreset--; cfg = presets[currentPreset]; applyLED(); }
     }
-    if (r1Pressed && !lastR1 && currentPreset < presetCount - 1) {
-      currentPreset++;
-      cfg = presets[currentPreset];
+    if (btnR1.pressed(dualshock->buttons() & BUTTON_SHOULDER_R)) {
+      if (currentPreset < presetCount - 1) { currentPreset++; cfg = presets[currentPreset]; applyLED(); }
     }
-    lastL1 = l1Pressed;
-    lastR1 = r1Pressed;
+
+    if (btnHandbrake.pressed(handbrake))  { if (dualshock) dualshock->playDualRumble(0, 65535, 80, 0); }
+    if (btnHandbrake.released(handbrake)) { if (dualshock) dualshock->playDualRumble(0, 0, 0, 0); }
+    btnHandbrake.update(handbrake);
 
     int rawAngle;
     if (abs(lxVal) <= cfg.steerDeadzone) {
@@ -543,27 +584,33 @@ void loop() {
 
     if (currentScreen != SCR_CTRL_MONITOR && currentScreen != SCR_MANUAL_CONTROL) {
       if (expMode) {
-        int target = constrain(map(r2Val, 0, 1020, 1000, cfg.maxTiming), 1000, cfg.maxTiming);
+        int   target   = constrain(map(r2Val, 0, 1020, 1000, cfg.maxTiming), 1000, cfg.maxTiming);
         float stickPct = r2Val / 1020.0f;
-        smoothSignal += (stickPct > 0.02f)
-                          ? (target - smoothSignal) * cfg.expAccelRate
-                          : (1000 - smoothSignal) * cfg.expDecayRate;
-        motorSignal = constrain((int)smoothSignal, 1000, cfg.maxTiming);
+        smoothSignal  += (stickPct > 0.02f)
+                           ? (target - smoothSignal) * cfg.expAccelRate
+                           : (1000   - smoothSignal) * cfg.expDecayRate;
+        motorSignal    = constrain((int)smoothSignal, 1000, cfg.maxTiming);
       } else {
-        motorSignal = constrain(map(r2Val, 0, 1020, 1000, cfg.maxTiming), 1000, cfg.maxTiming);
+        motorSignal  = constrain(map(r2Val, 0, 1020, 1000, cfg.maxTiming), 1000, cfg.maxTiming);
         smoothSignal = motorSignal;
       }
       if (motorSignal < 1000 + cfg.deadzone) motorSignal = 1000;
-      if (handbrake) {
-        motorSignal = 1000;
-      }
+      if (handbrake) motorSignal = 1000;
     }
+
   } else {
+    btnStart.update(false);
+    btnDpadUp.update(false);
+    btnDpadDown.update(false);
+    btnL1.update(false);
+    btnR1.update(false);
+    btnHandbrake.update(false);
+
     lxVal = ryVal = r2Val = l2Val = 0;
-    motorSignal = 1000;
+    motorSignal  = 1000;
     smoothSignal = 1000;
-    servoAngle = cfg.servoCenter;
-    handbrake = false;
+    servoAngle   = cfg.servoCenter;
+    handbrake    = false;
   }
 
   if (currentScreen == SCR_MANUAL_CONTROL) {
@@ -576,14 +623,11 @@ void loop() {
   steeringServo.write(servoAngle);
   shifterServo.write(shifterAngle);
 
-  // ── Menu ─────────────────────────────────────────────────────────────────
+  // ── Menu ──────────────────────────────────────────────────────────────────
   switch (currentScreen) {
 
     case SCR_DRIVE:
-      if (btn == 1) {
-        currentScreen = SCR_MAIN_MENU;
-        menuIndex = 0;
-      }
+      if (btn == 1) { currentScreen = SCR_MAIN_MENU; menuIndex = 0; }
       updateDriveDisplay();
       break;
 
@@ -591,20 +635,10 @@ void loop() {
       menuIndex = constrain(menuIndex + delta, 0, mainMenuCount - 1);
       if (btn == 1) {
         switch (menuIndex) {
-          case 0:
-            currentScreen = SCR_MOTOR_MENU;
-            menuIndex = 0;
-            break;
-          case 1:
-            currentScreen = SCR_SERVO_MENU;
-            menuIndex = 0;
-            break;
-          case 2:
-            currentScreen = SCR_PRESET_MENU;
-            menuIndex = currentPreset;
-            break;
-          case 3: currentScreen = SCR_CTRL_MONITOR; break;
-          case 4:
+          case 0: currentScreen = SCR_MOTOR_MENU;  menuIndex = 0; break;
+          case 1: currentScreen = SCR_SERVO_MENU;  menuIndex = 0; break;
+          case 2: currentScreen = SCR_CTRL_MONITOR; break;
+          case 3:
             currentScreen    = SCR_MANUAL_CONTROL;
             manualMotor      = 1000;
             manualServo      = cfg.servoCenter;
@@ -613,12 +647,9 @@ void loop() {
             break;
         }
       }
-      if (btn == 2) {
-        currentScreen = SCR_DRIVE;
-        menuIndex = 0;
-      }
+      if (btn == 2) { currentScreen = SCR_DRIVE; menuIndex = 0; }
       if (currentScreen == SCR_MAIN_MENU)
-        drawScrollMenu("Main Menu", mainMenuItems, mainMenuCount, menuIndex);
+        drawScrollMenu("Settings", mainMenuItems, mainMenuCount, menuIndex);
       break;
 
     case SCR_MOTOR_MENU:
@@ -626,16 +657,13 @@ void loop() {
       if (btn == 1) {
         editingItem = menuIndex;
         switch (menuIndex) {
-          case 0: enterEditInt("Max timing", cfg.maxTiming, 1000, 2000, 10); break;
-          case 1: enterEditInt("Deadzone", cfg.deadzone, 0, 200, 1); break;
-          case 2: enterEditFloat("Accel rate", cfg.expAccelRate, 0.01, 1.0, 0.01); break;
-          case 3: enterEditFloat("Decay rate", cfg.expDecayRate, 0.01, 1.0, 0.01); break;
+          case 0: enterEditInt("Max timing",   cfg.maxTiming,    1000, 2000, 10);   break;
+          case 1: enterEditInt("Deadzone",     cfg.deadzone,        0,  200,  1);   break;
+          case 2: enterEditFloat("Accel rate", cfg.expAccelRate, 0.01,  1.0, 0.01); break;
+          case 3: enterEditFloat("Decay rate", cfg.expDecayRate, 0.01,  1.0, 0.01); break;
         }
       }
-      if (btn == 2) {
-        currentScreen = SCR_MAIN_MENU;
-        menuIndex = 0;
-      }
+      if (btn == 2) { currentScreen = SCR_MAIN_MENU; menuIndex = 0; }
       if (currentScreen == SCR_MOTOR_MENU)
         drawScrollMenu("Motor", motorMenuItems, motorMenuCount, menuIndex);
       break;
@@ -645,51 +673,29 @@ void loop() {
       if (btn == 1) {
         editingItem = menuIndex;
         switch (menuIndex) {
-          case 0: enterEditInt("Servo min", cfg.servoMin, 0, 90, 1); break;
-          case 1: enterEditInt("Servo max", cfg.servoMax, 90, 180, 1); break;
-          case 2: enterEditBool("Reverse", cfg.servoReverse); break;
-          case 3: enterEditInt("Servo center", cfg.servoCenter, 80, 100, 1); break;
-          case 4: enterEditInt("Steer deadzone", cfg.steerDeadzone, 0, 100, 1); break;
+          case 0: enterEditInt("Servo min",    cfg.servoMin,        0,  90,  1); break;
+          case 1: enterEditInt("Servo max",    cfg.servoMax,       90, 180,  1); break;
+          case 2: enterEditBool("Reverse",     cfg.servoReverse);                break;
+          case 3: enterEditInt("Center",       cfg.servoCenter,    80, 100,  1); break;
+          case 4: enterEditInt("Steer DZ",     cfg.steerDeadzone,   0, 100,  1); break;
         }
       }
-      if (btn == 2) {
-        currentScreen = SCR_MAIN_MENU;
-        menuIndex = 0;
-      }
+      if (btn == 2) { currentScreen = SCR_MAIN_MENU; menuIndex = 0; }
       if (currentScreen == SCR_SERVO_MENU)
         drawScrollMenu("Servo", servoMenuItems, servoMenuCount, menuIndex);
       break;
 
-    case SCR_PRESET_MENU:
-      menuIndex = constrain(menuIndex + delta, 0, presetCount - 1);
-      if (btn == 1) {
-        currentPreset = menuIndex;
-        cfg = presets[currentPreset];
-        currentScreen = SCR_DRIVE;
-        menuIndex = 0;
-      }
-      if (btn == 2) {
-        currentScreen = SCR_MAIN_MENU;
-        menuIndex = 2;
-      }
-      if (currentScreen == SCR_PRESET_MENU)
-        drawScrollMenu("Mode", presetNames, presetCount, menuIndex);
-      break;
-
     case SCR_CTRL_MONITOR:
-      if (btn == 2) {
-        currentScreen = SCR_MAIN_MENU;
-        menuIndex = 3;
-      }
+      if (btn == 2) { currentScreen = SCR_MAIN_MENU; menuIndex = 3; }
       updateCtrlMonitor();
       break;
-    
+
     case SCR_MANUAL_CONTROL:
       if (delta != 0) {
         switch (manualEditTarget) {
-          case 0: manualMotor   = constrain(manualMotor + delta * 20, 1000, cfg.maxTiming); break;
-          case 1: manualServo   = constrain(manualServo + delta * 10, cfg.servoMin, cfg.servoMax); break;
-          case 2: manualShifter = constrain(manualShifter + delta * 90, 0, 180); break;
+          case 0: manualMotor   = constrain(manualMotor   + delta * 20, 1000, cfg.maxTiming);        break;
+          case 1: manualServo   = constrain(manualServo   + delta * 10, cfg.servoMin, cfg.servoMax); break;
+          case 2: manualShifter = constrain(manualShifter + delta * 90, 0, 180);                     break;
         }
       }
       if (btn == 1) manualEditTarget = (manualEditTarget + 1) % 3;
@@ -705,27 +711,20 @@ void loop() {
 
     case SCR_EDIT_VALUE:
       if (delta != 0) {
-        if (edit.type == EDIT_INT)
+        if (edit.type == EDIT_INT) {
           edit.intVal = constrain(edit.intVal + delta * edit.intStep, edit.intMin, edit.intMax);
-        else if (edit.type == EDIT_FLOAT) {
+        } else if (edit.type == EDIT_FLOAT) {
           edit.floatVal = constrain(edit.floatVal + delta * edit.floatStep, edit.floatMin, edit.floatMax);
           edit.floatVal = roundf(edit.floatVal * 100) / 100;
-        } else if (edit.type == EDIT_BOOL)
+        } else {
           edit.boolVal = !edit.boolVal;
+        }
       }
-      if (btn == 1) {
-        applyEdit();
-        currentScreen = prevMenu;
-        menuIndex = editingItem;
-      }
-      if (btn == 2) {
-        currentScreen = prevMenu;
-        menuIndex = editingItem;
-      }
+      if (btn == 1) { applyEdit(); currentScreen = prevMenu; menuIndex = editingItem; }
+      if (btn == 2) {              currentScreen = prevMenu; menuIndex = editingItem; }
       drawEditScreen();
       break;
   }
 
   delay(10);
 }
-
